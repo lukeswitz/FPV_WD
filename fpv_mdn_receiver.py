@@ -43,6 +43,7 @@ Options:
 
 import json
 import logging
+import math
 import time
 import argparse
 import serial
@@ -126,19 +127,29 @@ def read_serial(serial_port, baud_rate):
             logging.exception("Unexpected error while reading serial port: %s", e)
             time.sleep(RECONNECT_DELAY)
 
+def estimate_distance(rssi, freq):
+    tx_power_dbm = 27.8  # Hardcoded transmission power in dBm (600mW) FPV
+    path_loss_exponent = 2.7  # Typical for urban/suburban environments
+    freq_mhz = freq / 1e6
+
+    distance_m = 10 ** ((tx_power_dbm - rssi - 20 * math.log10(freq_mhz) + 27.55) / (10 * path_loss_exponent))
+    return distance_m
+
 def process_message(data):
     """
-    Extracts key elements from the message, including source node information.
-    
+    Extracts key elements from the message, including source node information and estimated distance.
+
     Returns a structured dictionary containing:
       - source_node: the node ID from which the message originated
       - message_type: 'nodeMsg' or 'nodeAlert'
       - status: status string (e.g., 'NEW CONTACT LOCK')
       - time, rssi, freq, var, data: additional key data if present
+      - distance: estimated distance to the source based on RSSI and frequency
     """
     try:
         msg = data.get("msg", {})
         source = data.get("from", {}).get("node", "unknown")
+        
         processed = {
             "source_node": source,
             "message_type": msg.get("type", ""),
@@ -149,6 +160,11 @@ def process_message(data):
             "var": msg.get("var"),
             "data": msg.get("data")
         }
+
+        # Estimate distance only if both RSSI and frequency are available
+        if processed["rssi"] is not None and processed["freq"] is not None:
+            processed["distance_m"] = estimate_distance(processed["rssi"], processed["freq"])
+
         return processed
     except Exception as e:
         logging.error("Error processing message: %s", e)
