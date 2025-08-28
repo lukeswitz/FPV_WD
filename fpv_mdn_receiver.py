@@ -24,21 +24,29 @@ SOFTWARE.
 """
 
 """
-fpv_detector.py
+fpv_mdn_receiver.py
 
 Connects to a specified serial port, receives JSON-like messages from an FPV detection sensor,
-enriches them with GPS data from gpsd, and publishes via a ZMQ XPUB socket for better scalability.
+enriches them with GPS data from gpsd, and publishes via a ZMQ PUB socket for compatibility
+with zmq_decoder.py.
 
 Usage:
-    python3 fpv_detector.py --serial /dev/ttyACM0 --baud 115200 --zmq-port 4020 --stationary --debug
+    python3 fpv_mdn_receiver.py --serial /dev/ttyACM0 --baud 115200 --zmq-port 4222 --stationary --debug
+    python3 fpv_mdn_receiver.py --debug --log-file /var/log/fpv_receiver.log
 
 Options:
-    --serial        Path to the serial device (default: /dev/ACM0)
-    --baud          Baud rate for serial communication (default: 115200)
-    --zmq-port      ZMQ port to publish messages on (default: 4020)
-    --stationary    If true, read GPS location only once at startup
-                    (assumes the WarDragon hardware is stationary).
-    --debug         Enable debug output to console.
+    --serial              Path to the serial device (default: /dev/ACM0)
+    --baud                Baud rate for serial communication (default: 115200)
+    --zmq-port            ZMQ port to publish messages on (default: 4222)
+    --stationary          If true, read GPS location only once at startup
+                          (assumes the hardware is stationary).
+    --debug               Enable debug output to console.
+    --log-file            Path to save logs (default: no file logging)
+    --tx-power            Transmission power in dBm (default: 27.8)
+    --path-loss-exponent  Path loss exponent for distance estimation (default: 2.7)
+    --adv-address         Advertising address for ZMQ decoder (default: 0x8e89bed6)
+    --gpsd-host           GPSD host address (default: 127.0.0.1)
+    --gpsd-port           GPSD port (default: 2947)
 """
 
 import json
@@ -51,19 +59,26 @@ import zmq
 from gps3 import gps3
 import sys
 import signal
+from datetime import datetime
 
-# Defaults
+# Defaults - all configurable via command line
 DEFAULT_SERIAL_PORT = "/dev/ttyACM0"
 DEFAULT_BAUD_RATE = 115200
-DEFAULT_ZMQ_PORT = 4020
-GPSD_HOST = "127.0.0.1"
-GPSD_PORT = 2947
+DEFAULT_ZMQ_PORT = 4222
+DEFAULT_GPSD_HOST = "127.0.0.1"
+DEFAULT_GPSD_PORT = 2947
+DEFAULT_TX_POWER_DBM = 27.8  
+DEFAULT_PATH_LOSS_EXPONENT = 2.7
+DEFAULT_ADV_ADDRESS = 0x8e89bed6
 RECONNECT_DELAY = 5  # seconds
+
+# Global cache to store detections 
+detection_cache = {}
 
 def parse_args():
     """Parses command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="FPV Detector: Reads JSON from serial, adds GPS, publishes via ZMQ."
+        description="FPV MDN Receiver: Reads JSON from serial, adds GPS, publishes via ZMQ."
     )
     parser.add_argument("--serial", default=DEFAULT_SERIAL_PORT,
                         help="Serial port to connect to.")
@@ -72,23 +87,66 @@ def parse_args():
     parser.add_argument("--zmq-port", type=int, default=DEFAULT_ZMQ_PORT,
                         help="ZMQ port to publish messages on.")
     parser.add_argument("--stationary", action="store_true",
-                        help="If set, read GPS once at startup (assumes WarDragon is stationary).")
+                        help="If set, read GPS once at startup (assumes hardware is stationary).")
     parser.add_argument("--debug", action="store_true",
                         help="Enable debug logging.")
+    parser.add_argument("--log-file", 
+                        help="Path to log file for storing all log messages.")
+    parser.add_argument("--tx-power", type=float, default=DEFAULT_TX_POWER_DBM,
+                        help="Transmission power in dBm for distance estimation.")
+    parser.add_argument("--path-loss-exponent", type=float, default=DEFAULT_PATH_LOSS_EXPONENT,
+                        help="Path loss exponent for distance estimation.")
+    parser.add_argument("--adv-address", type=lambda x: int(x, 0), default=DEFAULT_ADV_ADDRESS,
+                        help="Advertising address for ZMQ decoder (in hex, e.g., 0x8e89bed6).")
+    parser.add_argument("--gpsd-host", default=DEFAULT_GPSD_HOST,
+                        help="GPSD host address.")
+    parser.add_argument("--gpsd-port", type=int, default=DEFAULT_GPSD_PORT,
+                        help="GPSD port.")
     return parser.parse_args()
 
-def setup_logging(debug: bool):
-    """Configures logging."""
-    log_level = logging.DEBUG if debug else logging.WARNING
-    logging.basicConfig(level=log_level,
-                        format="%(asctime)s [%(levelname)s] %(message)s")
+def setup_logging(debug: bool, log_file: str = None):
+    """
+    Configures logging to console and optionally to a file.
+    Debug mode shows more verbose logs on console, otherwise only warnings and errors.
+    If log_file is specified, all logs are written to the file regardless of debug setting.
+    """
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)  # Capture all logs
+    root_logger.handlers = []  # Clear existing handlers
+    
+    # Format for all handlers
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+    
+    # Console handler - level depends on debug flag
+    console_level = logging.DEBUG if debug else logging.WARNING
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(console_level)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+    
+    # File handler - always DEBUG level if enabled
+    if log_file:
+        try:
+            file_handler = logging.FileHandler(log_file, mode='a')  # Append mode
+            file_handler.setLevel(logging.DEBUG)  # All logs go to file
+            file_handler.setFormatter(formatter)
+            root_logger.addHandler(file_handler)
+            logging.info(f"Log file initialized: {log_file}")
+        except (PermissionError, FileNotFoundError) as e:
+            logging.error(f"Failed to create log file at {log_file}: {e}")
+            logging.warning("Continuing with console logging only")
 
-def init_gps_connection():
+def iso_timestamp_now() -> str:
+    """Return current UTC time as an ISO8601 string with 'Z' suffix."""
+    return time.strftime("%Y-%m-%dT%H:%M:%S.%fZ", time.gmtime())
+
+def init_gps_connection(host, port):
     """Initializes a persistent gpsd connection (socket + data_stream)."""
     gps_socket = gps3.GPSDSocket()
     data_stream = gps3.DataStream()
     try:
-        gps_socket.connect(host=GPSD_HOST, port=GPSD_PORT)
+        gps_socket.connect(host=host, port=port)
         gps_socket.watch()
         logging.info("GPS connection established.")
     except Exception as e:
@@ -127,47 +185,152 @@ def read_serial(serial_port, baud_rate):
             logging.exception("Unexpected error while reading serial port: %s", e)
             time.sleep(RECONNECT_DELAY)
 
-def estimate_distance(rssi, freq):
-    tx_power_dbm = 27.8  # Hardcoded transmission power in dBm (600mW) FPV
-    path_loss_exponent = 2.7  # Typical for urban/suburban environments
-    freq_mhz = freq / 1e6
-
-    distance_m = 10 ** ((tx_power_dbm - rssi - 20 * math.log10(freq_mhz) + 27.55) / (10 * path_loss_exponent))
-    return distance_m
-
-def process_message(data):
+def estimate_distance(rssi, freq, tx_power_dbm, path_loss_exponent):
     """
-    Extracts key elements from the message, including source node information and estimated distance.
-
-    Returns a structured dictionary containing:
-      - source_node: the node ID from which the message originated
-      - message_type: 'nodeMsg' or 'nodeAlert'
-      - status: status string (e.g., 'NEW CONTACT LOCK')
-      - time, rssi, freq, var, data: additional key data if present
-      - distance: estimated distance to the source based on RSSI and frequency
+    FPV-specific distance estimation based on empirical RSSI values.
+    
+    Args:
+      rssi (float): Raw RSSI value from FPV hardware (typically 1000-2000+ range)
+      freq (float): Frequency in Hz
+      tx_power_dbm (float): Transmission power in dBm (not used in empirical model)
+      path_loss_exponent (float): Path loss exponent (not used in empirical model)
+      
+    Returns:
+      float: Estimated distance in meters
     """
     try:
-        msg = data.get("msg", {})
-        source = data.get("from", {}).get("node", "unknown")
+        if rssi <= 0:
+            return None
+      
+        # FPV hardware empirical distance mapping
+        # Based on your RSSI range of ~1200-1400
+        # Higher RSSI = stronger signal = closer distance
+      
+        if rssi >= 2000:
+            distance = 10.0      # Very close
+        elif rssi >= 1800:
+            distance = 25.0      # Close
+        elif rssi >= 1600:
+            distance = 50.0      # Medium-close
+        elif rssi >= 1400:
+            distance = 100.0     # Medium
+        elif rssi >= 1200:
+            distance = 200.0     # Medium-far
+        elif rssi >= 1000:
+            distance = 500.0     # Far
+        elif rssi >= 800:
+            distance = 1000.0    # Very far
+        else:
+            distance = 2000.0    # Maximum range
+          
+        # Fine-tune within ranges for more granular estimates
+        if 1200 <= rssi < 1400:
+            # Linear interpolation within the medium range
+            # rssi 1400 -> 100m, rssi 1200 -> 200m
+            distance = 300 - (rssi - 1200) * 0.5
+        elif 1400 <= rssi < 1600:
+            # rssi 1600 -> 50m, rssi 1400 -> 100m  
+            distance = 150 - (rssi - 1400) * 0.25
+        elif 1600 <= rssi < 1800:
+            # rssi 1800 -> 25m, rssi 1600 -> 50m
+            distance = 75 - (rssi - 1600) * 0.125
+        elif rssi >= 1800:
+            # Very close range with fine granularity
+            distance = max(5.0, 50 - (rssi - 1800) * 0.05)
+          
+        return round(distance, 1)
+  
+    except Exception as e:
+        logging.error("Error calculating distance: %s", e)
+        return 500.0  # Default middle-range estimate
+
+
+def format_for_zmq_decoder(processed_msg, adv_address):
+  """
+  Format the message to be compatible with zmq_decoder's expected input format.
+  For each detection, creates a properly formatted message that zmq_decoder can process.
+  The advertising address is configurable.
+  """
+  formatted_msg = {
+    "AUX_ADV_IND": {
+      "rssi": processed_msg.get("rssi", 0),
+      "aa": adv_address,
+      "time": iso_timestamp_now()
+    },
+    "aext": {
+      "AdvA": f"{processed_msg.get('source_inst', '')}-{processed_msg.get('source_node', '')} random"
+    }
+  }
+  
+  # Add drone detection specific data for both NEW CONTACT LOCK and LOCK UPDATE
+  if processed_msg.get("message_type") == "nodeAlert" and ("NEW CONTACT LOCK" in processed_msg.get("status", "") or 
+                              "LOCK UPDATE" in processed_msg.get("status", "")):
+    # Example OpenDroneID header
+    formatted_msg["AdvData"] = "020116faff0d01" 
+  
+    # Add GPS coordinates if available
+    if "gps_lat" in processed_msg and "gps_lon" in processed_msg:
+      formatted_msg["location"] = {
+        "lat": processed_msg["gps_lat"],
+        "lon": processed_msg["gps_lon"]
+      }
+      
+    # Add additional data if available
+    if "distance_m" in processed_msg and processed_msg["distance_m"] is not None:
+      formatted_msg["distance"] = processed_msg["distance_m"]
+      
+    # Add frequency data
+    if "freq" in processed_msg and processed_msg["freq"] is not None:
+      formatted_msg["frequency"] = processed_msg["freq"]
+      
+  return formatted_msg
+def process_fpv_message(data):
+    """
+    Process an FPV MDN message based on the format in the documentation:
+    Format: {"from":{"inst":"XX","node":"XXXX"},"to":{"inst":"XX","node":"XXXX"},"msg":{...}}
+    """
+    try:
+        # Extract message components based on the documented format
+        from_info = data.get("from", {})
+        to_info = data.get("to", {})
+        msg_info = data.get("msg", {})
+        
+        if not from_info or not msg_info:
+            logging.warning("Incomplete message format received")
+            return {}
+        
+        source_inst = from_info.get("inst", "")
+        source_node = from_info.get("node", "")
+        
+        # Extract message fields based on documented format
+        msg_type = msg_info.get("type", "")
+        msg_time = msg_info.get("time", 0)
+        msg_freq = msg_info.get("freq", 0)
+        msg_rssi = msg_info.get("rssi", 0)
+        msg_stat = msg_info.get("stat", "")
+        
+        # Process command messages
+        if msg_type == "nodeCmd":
+            cmd = msg_info.get("cmd", "")
+            var = msg_info.get("var", "")
+            data_val = msg_info.get("data", 0)
+            logging.debug(f"Command message: {cmd}, var: {var}, data: {data_val}")
         
         processed = {
-            "source_node": source,
-            "message_type": msg.get("type", ""),
-            "status": msg.get("stat", ""),
-            "time": msg.get("time"),
-            "rssi": msg.get("rssi"),
-            "freq": msg.get("freq"),
-            "var": msg.get("var"),
-            "data": msg.get("data")
+            "source_inst": source_inst,
+            "source_node": source_node,
+            "message_type": msg_type,
+            "time": msg_time,
+            "rssi": msg_rssi,
+            "freq": msg_freq,
+            "status": msg_stat,
+            "var": msg_info.get("var", ""),
+            "data": msg_info.get("data", 0)
         }
-
-        # Estimate distance only if both RSSI and frequency are available
-        if processed["rssi"] is not None and processed["freq"] is not None:
-            processed["distance_m"] = estimate_distance(processed["rssi"], processed["freq"])
 
         return processed
     except Exception as e:
-        logging.error("Error processing message: %s", e)
+        logging.error("Error processing FPV message: %s", e)
         return {}
 
 def signal_handler(sig, frame):
@@ -176,20 +339,25 @@ def signal_handler(sig, frame):
 
 def main():
     args = parse_args()
-    setup_logging(args.debug)
+    setup_logging(args.debug, args.log_file)
     
     # Register signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    # Log startup information
+    logging.info("FPV MDN Receiver starting up")
+    logging.info(f"Debug mode: {'Enabled' if args.debug else 'Disabled'}")
+    logging.info(f"Log file: {args.log_file if args.log_file else 'None'}")
 
     # Initialize GPS connection and cache location if stationary
     gps_socket, data_stream = None, None
     lat_cache, lon_cache = 0.0, 0.0
 
     if not args.stationary:
-        gps_socket, data_stream = init_gps_connection()
+        gps_socket, data_stream = init_gps_connection(args.gpsd_host, args.gpsd_port)
     else:
-        gps_socket, data_stream = init_gps_connection()
+        gps_socket, data_stream = init_gps_connection(args.gpsd_host, args.gpsd_port)
         if gps_socket and data_stream:
             lat_cache, lon_cache = get_gps_location(gps_socket, data_stream)
             gps_socket.close()
@@ -197,15 +365,15 @@ def main():
         else:
             logging.error("GPS initialization failed in stationary mode. Using default coordinates.")
 
-    # Setup ZMQ XPUB socket for message publication
+    # Setup ZMQ PUB socket for compatibility with zmq_decoder
     context = zmq.Context()
-    zmq_socket = context.socket(zmq.XPUB)
+    zmq_socket = context.socket(zmq.PUB)
     zmq_socket.setsockopt(zmq.SNDHWM, 1000)  # High-water mark for buffering
     zmq_socket.setsockopt(zmq.LINGER, 0)      # Ensure clean socket shutdown
     zmq_endpoint = f"tcp://0.0.0.0:{args.zmq_port}"
     try:
         zmq_socket.bind(zmq_endpoint)
-        logging.info("ZMQ XPUB socket bound to %s", zmq_endpoint)
+        logging.info("ZMQ PUB socket bound to %s", zmq_endpoint)
     except zmq.ZMQError as e:
         logging.error("Failed to bind ZMQ socket: %s", e)
         sys.exit(1)
@@ -219,39 +387,45 @@ def main():
                 logging.warning("Failed to parse JSON: %s", line)
                 continue
 
-            processed_msg = process_message(raw_data)
+            # Use the specific message parser based on the documented format
+            processed_msg = process_fpv_message(raw_data)
             if not processed_msg:
                 continue
 
             # Handle message types and log details
             message_type = processed_msg.get("message_type", "")
             status = processed_msg.get("status", "")
+            
             if message_type == "nodeMsg":
-                if status.startswith("NODE_START"):
-                    logging.info("Boot message received from node %s: %s",
-                                 processed_msg["source_node"], status)
+                if "NODE_START" in status:
+                    logging.info("Boot message received from node %s (inst %s): %s",
+                                 processed_msg["source_node"], processed_msg["source_inst"], status)
                 elif "CALIBRATION COMPLETE" in status:
-                    logging.info("Calibration complete from node %s: %s",
-                                 processed_msg["source_node"], status)
+                    logging.info("Calibration complete from node %s (inst %s): %s",
+                                 processed_msg["source_node"], processed_msg["source_inst"], status)
                 else:
-                    logging.debug("nodeMsg from node %s: %s",
-                                  processed_msg["source_node"], status)
+                    logging.debug("nodeMsg from node %s (inst %s): %s",
+                                  processed_msg["source_node"], processed_msg["source_inst"], status)
             elif message_type == "nodeAlert":
                 if "NEW CONTACT LOCK" in status:
-                    logging.warning("New FPV Drone detected from node %s!",
-                                    processed_msg["source_node"])
+                    logging.warning("New FPV Drone detected from node %s (inst %s)!",
+                                    processed_msg["source_node"], processed_msg["source_inst"])
                 elif "LOCK UPDATE" in status:
-                    logging.info("Lock update from node %s.",
-                                 processed_msg["source_node"])
+                    logging.info("Lock update from node %s (inst %s).",
+                                 processed_msg["source_node"], processed_msg["source_inst"])
                 elif "LOST CONTACT LOCK" in status:
-                    logging.warning("Lost contact lock from node %s.",
-                                    processed_msg["source_node"])
+                    logging.warning("Lost contact lock from node %s (inst %s).",
+                                    processed_msg["source_node"], processed_msg["source_inst"])
                 else:
-                    logging.debug("nodeAlert from node %s: %s",
-                                  processed_msg["source_node"], status)
+                    logging.debug("nodeAlert from node %s (inst %s): %s",
+                                  processed_msg["source_node"], processed_msg["source_inst"], status)
                 if processed_msg.get("rssi") is not None:
                     logging.debug("RSSI: %s, Frequency: %s",
                                   processed_msg.get("rssi"), processed_msg.get("freq"))
+            elif message_type == "nodeCmd":
+                logging.debug("Command message received for node %s (inst %s): var=%s, data=%s",
+                              processed_msg["source_node"], processed_msg["source_inst"],
+                              processed_msg.get("var"), processed_msg.get("data"))
 
             # Update GPS location if applicable
             if not args.stationary and gps_socket and data_stream:
@@ -264,13 +438,72 @@ def main():
             processed_msg["gps_lat"] = lat
             processed_msg["gps_lon"] = lon
 
-            # Publish the structured JSON message via ZMQ
+            # Calculate distance estimation if applicable
+            if processed_msg.get("rssi") is not None and processed_msg.get("freq") is not None:
+                processed_msg["distance_m"] = estimate_distance(
+                    processed_msg["rssi"], 
+                    processed_msg["freq"], 
+                    args.tx_power, 
+                    args.path_loss_exponent
+                )
+
+            # Format message to be compatible with zmq_decoder expectations
+            zmq_formatted_msg = format_for_zmq_decoder(processed_msg, args.adv_address)
+
+            # Also prepare a drone detection message for FPV detections using values from the message
+            if message_type == "nodeAlert":
+              source_key = f"{processed_msg['source_inst']}-{processed_msg['source_node']}"
+              
+              # Initialize or update detection data
+              if source_key not in detection_cache or "NEW CONTACT LOCK" in status:
+                # New detection - create full data structure
+                detection_cache[source_key] = {
+                  "timestamp": iso_timestamp_now(),
+                  "manufacturer": processed_msg.get("source_inst", ""),
+                  "device_type": f"FPV{processed_msg.get('freq', 0)/1e6:.1f}MHz",
+                  "frequency": processed_msg.get("freq", 0),
+                  "bandwidth": processed_msg.get("var", ""),
+                  "signal_strength": processed_msg.get("rssi", 0),
+                  "detection_source": source_key
+                }
+              else:
+                # Update only changed fields
+                detection_cache[source_key]["timestamp"] = iso_timestamp_now()
+                detection_cache[source_key]["signal_strength"] = processed_msg.get("rssi", 0)
+                
+                if processed_msg.get("freq") is not None:
+                  detection_cache[source_key]["frequency"] = processed_msg.get("freq")
+                  detection_cache[source_key]["device_type"] = f"FPV{processed_msg.get('freq', 0)/1e6:.1f}MHz"
+                  
+              # Always update these fields
+              detection_cache[source_key]["status"] = status
+              
+              # Update distance if available
+              if processed_msg.get("distance_m") is not None:
+                detection_cache[source_key]["estimated_distance"] = processed_msg["distance_m"]
+                
+              # Update GPS if available
+              if lat != 0.0 or lon != 0.0:
+                detection_cache[source_key]["sensor_lat"] = lat
+                detection_cache[source_key]["sensor_lon"] = lon
+                
+              # Create and publish the detection message
+              detection_messages = [{"FPV Detection": detection_cache[source_key]}]
+              zmq_socket.send_string(json.dumps(detection_messages))
+              logging.debug("Published drone detection message: %s", json.dumps(detection_messages))
+              
+              # Clean up cache if contact is lost
+              if "LOST CONTACT LOCK" in status:
+                detection_cache.pop(source_key, None)
+                
+            # Publish the original message in zmq_decoder compatible format
             try:
-                json_message = json.dumps(processed_msg)
+                json_message = json.dumps(zmq_formatted_msg)
                 zmq_socket.send_string(json_message)
-                logging.debug("Published: %s", json_message)
+                logging.debug("Published ZMQ message: %s", json_message)
             except Exception as e:
                 logging.error("Error publishing message via ZMQ: %s", e)
+                
     except KeyboardInterrupt:
         logging.info("KeyboardInterrupt received. Shutting down...")
     except Exception as e:
@@ -292,3 +525,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+  
+  
