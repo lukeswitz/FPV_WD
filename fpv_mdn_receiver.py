@@ -202,18 +202,14 @@ def estimate_distance(rssi, freq, tx_power_dbm, path_loss_exponent):
         if rssi <= 0:
             return None
       
-        # FPV hardware empirical distance mapping
-        # Based on your RSSI range of ~1200-1400
-        # Higher RSSI = stronger signal = closer distance
-      
-        if rssi >= 2000:
-            distance = 10.0      # Very close
-        elif rssi >= 1800:
-            distance = 25.0      # Close
+        if rssi >= 2500:
+            distance = 50.0      # Very close
+        elif rssi >= 2000:
+            distance = 75.0      # Close
         elif rssi >= 1600:
-            distance = 50.0      # Medium-close
+            distance = 100.0      # Medium-close
         elif rssi >= 1400:
-            distance = 100.0     # Medium
+            distance = 150.0     # Medium
         elif rssi >= 1200:
             distance = 200.0     # Medium-far
         elif rssi >= 1000:
@@ -234,7 +230,7 @@ def estimate_distance(rssi, freq, tx_power_dbm, path_loss_exponent):
         elif 1600 <= rssi < 1800:
             # rssi 1800 -> 25m, rssi 1600 -> 50m
             distance = 75 - (rssi - 1600) * 0.125
-        elif rssi >= 1800:
+        elif rssi >= 2500:
             # Very close range with fine granularity
             distance = max(5.0, 50 - (rssi - 1800) * 0.05)
           
